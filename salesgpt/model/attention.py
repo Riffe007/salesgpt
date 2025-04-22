@@ -1,8 +1,8 @@
 """
-FlashAttention2 implementation for SalesGPT.
+Attention implementation for SalesGPT.
 
-This module provides an efficient implementation of attention using the FlashAttention2
-algorithm for faster and more memory-efficient attention computation.
+This module provides efficient implementation of attention mechanisms with
+graceful fallbacks when optimized libraries are not available.
 """
 import math
 import importlib.util
@@ -12,14 +12,35 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Check for optional dependencies
+USE_FLASH_ATTENTION = False
+USE_XFORMERS = False
+
+# Try to import flash_attn, but don't fail if not available
+try:
+    if importlib.util.find_spec("flash_attn") is not None:
+        USE_FLASH_ATTENTION = True
+        import flash_attn
+except (ImportError, ModuleNotFoundError):
+    print("FlashAttention not available, using standard attention mechanism")
+    USE_FLASH_ATTENTION = False
+
+# Try to import xformers, but don't fail if not available
+try:
+    if importlib.util.find_spec("xformers") is not None:
+        USE_XFORMERS = True
+        import xformers.ops
+except (ImportError, ModuleNotFoundError):
+    print("xformers not available, using standard attention mechanism")
+    USE_XFORMERS = False
+
 
 class FlashAttention(nn.Module):
     """
-    FlashAttention2 implementation for memory-efficient attention.
+    Attention implementation with fallbacks.
     
-    This implementation uses the flash_attn library for efficient
-    attention computation on GPU hardware when available, with fallbacks
-    to standard attention mechanisms.
+    This implementation tries to use optimized attention mechanisms when available
+    (FlashAttention2, xformers), falling back to standard PyTorch attention otherwise.
     
     Attributes:
         dim (int): Hidden dimension
@@ -28,8 +49,6 @@ class FlashAttention(nn.Module):
         dropout (float): Dropout probability
         causal (bool): Whether to use causal attention masking
         scale (float): Scaling factor for attention scores
-        flash_attn_supported (bool): Whether FlashAttention2 is supported on current device
-        xformers_fallback (bool): Whether to use xFormers as fallback if FlashAttention fails
         qkv_proj (nn.Linear): Linear projection for query, key, value
         out_proj (nn.Linear): Linear projection for output
     """
@@ -45,7 +64,7 @@ class FlashAttention(nn.Module):
         xformers_fallback: bool = True,
     ):
         """
-        Initialize FlashAttention module.
+        Initialize attention module.
         
         Args:
             dim: Hidden dimension
@@ -54,7 +73,7 @@ class FlashAttention(nn.Module):
             dropout: Dropout probability
             causal: Whether to use causal attention masking
             qkv_bias: Whether to use bias for query, key, value projections
-            xformers_fallback: Whether to fall back to xFormers if FlashAttention fails
+            xformers_fallback: Whether to try xformers before standard attention
         """
         super().__init__()
         self.dim = dim
@@ -63,15 +82,7 @@ class FlashAttention(nn.Module):
         self.dropout = dropout
         self.causal = causal
         self.scale = 1.0 / math.sqrt(self.head_dim)
-        self.xformers_fallback = xformers_fallback
-        
-        # Check if FlashAttention2 is supported on current device
-        self.flash_attn_supported = hasattr(importlib.util.find_spec("flash_attn"), "name")
-        if not self.flash_attn_supported and not xformers_fallback:
-            raise ImportError(
-                "FlashAttention is not available. "
-                "Please install flash-attn or enable xformers fallback."
-            )
+        self.xformers_fallback = xformers_fallback and USE_XFORMERS
         
         # Query, key, value projections
         self.qkv_proj = nn.Linear(dim, 3 * self.num_heads * self.head_dim, bias=qkv_bias)
@@ -83,6 +94,14 @@ class FlashAttention(nn.Module):
         if qkv_bias:
             nn.init.zeros_(self.qkv_proj.bias)
         nn.init.zeros_(self.out_proj.bias)
+        
+        # Log which attention implementation will be used
+        if USE_FLASH_ATTENTION:
+            print("Using FlashAttention for efficient attention")
+        elif self.xformers_fallback:
+            print("Using xformers for efficient attention")
+        else:
+            print("Using standard PyTorch attention implementation")
     
     def forward(
         self,
@@ -90,7 +109,7 @@ class FlashAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Forward pass for FlashAttention.
+        Forward pass for attention.
         
         Args:
             x: Input tensor [batch_size, seq_len, dim]
@@ -107,8 +126,8 @@ class FlashAttention(nn.Module):
         qkv = qkv.permute(0, 2, 3, 1, 4)  # [batch, 3, heads, seq_len, head_dim]
         q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
         
-        # Perform attention with FlashAttention2 if available
-        if self.flash_attn_supported:
+        # Determine which attention implementation to use
+        if USE_FLASH_ATTENTION:
             try:
                 from flash_attn import flash_attn_func
                 
@@ -131,16 +150,20 @@ class FlashAttention(nn.Module):
                 # Reshape output
                 output = output.reshape(batch_size, seq_len, -1)
                 
-            except (ImportError, RuntimeError) as e:
+            except Exception as e:
+                print(f"FlashAttention failed: {e}. Falling back to alternative.")
                 if self.xformers_fallback:
                     output = self._xformers_attention(q, k, v, attention_mask)
                 else:
                     output = self._standard_attention(q, k, v, attention_mask)
-        else:
-            if self.xformers_fallback:
+        elif self.xformers_fallback:
+            try:
                 output = self._xformers_attention(q, k, v, attention_mask)
-            else:
+            except Exception as e:
+                print(f"xformers attention failed: {e}. Falling back to standard attention.")
                 output = self._standard_attention(q, k, v, attention_mask)
+        else:
+            output = self._standard_attention(q, k, v, attention_mask)
         
         # Project output
         output = self.out_proj(output)
@@ -163,6 +186,9 @@ class FlashAttention(nn.Module):
         Returns:
             Output tensor [batch, seq_len, dim]
         """
+        if not USE_XFORMERS:
+            return self._standard_attention(q, k, v, attention_mask)
+            
         try:
             import xformers.ops as xops
             
@@ -192,7 +218,7 @@ class FlashAttention(nn.Module):
             
             return output
         
-        except ImportError:
+        except Exception:
             return self._standard_attention(q, k, v, attention_mask)
     
     def _standard_attention(
@@ -200,7 +226,7 @@ class FlashAttention(nn.Module):
         attention_mask: Optional[torch.Tensor]
     ) -> torch.Tensor:
         """
-        Compute attention using standard PyTorch operations as last resort.
+        Compute attention using standard PyTorch operations.
         
         Args:
             q: Query tensor [batch, heads, seq_len, head_dim]
@@ -242,7 +268,7 @@ class FlashAttention(nn.Module):
 
 class MHA(nn.Module):
     """
-    Multi-head attention wrapper around FlashAttention.
+    Multi-head attention wrapper around attention implementation.
     
     This is a convenience wrapper to handle different attention implementations
     uniformly in the architecture.
@@ -268,7 +294,7 @@ class MHA(nn.Module):
             num_heads: Number of attention heads
             dropout: Dropout probability
             causal: Whether to use causal attention masking
-            use_flash_attn: Whether to use FlashAttention (use standard attention if False)
+            use_flash_attn: Whether to try using FlashAttention
             qkv_bias: Whether to use bias for query, key, value projections
         """
         super().__init__()
